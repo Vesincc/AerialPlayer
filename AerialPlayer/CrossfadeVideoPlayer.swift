@@ -63,7 +63,7 @@ final class CrossfadeVideoPlayer {
     }
 
     func load(url: URL) async throws {
-        stop()
+        if phase != .idle { stop() }
         let token = generation
         phase = .preparing
         let asset = AVURLAsset(url: url)

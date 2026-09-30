@@ -6,6 +6,7 @@ import CoreGraphics
 @MainActor
 final class DesktopWallpaperWindow: NSWindow {
     let videoSurface = CALayer()
+    private(set) var transitionImageLayer: CALayer?
 
     init(screen: NSScreen) {
         super.init(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
@@ -28,6 +29,22 @@ final class DesktopWallpaperWindow: NSWindow {
 
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
+
+    func setTransitionImage(_ image: CGImage, gravity: CALayerContentsGravity) {
+        let layer = CALayer()
+        layer.frame = videoSurface.bounds
+        layer.contents = image
+        layer.contentsGravity = gravity
+        layer.backgroundColor = NSColor.black.cgColor
+        layer.zPosition = 1
+        videoSurface.addSublayer(layer)
+        transitionImageLayer = layer
+    }
+
+    func clearTransitionImage() {
+        transitionImageLayer?.removeFromSuperlayer()
+        transitionImageLayer = nil
+    }
 
     func update(screen: NSScreen) {
         let surfaceFrame = NSRect(origin: .zero, size: screen.frame.size)

@@ -1,5 +1,6 @@
 import AppKit
 import CoreGraphics
+import ImageIO
 import QuartzCore
 import Foundation
 import Darwin
@@ -17,11 +18,11 @@ final class WallpaperController {
         var presented = false
         var retiring = false
 
-        init(wallpaper: ResolvedWallpaper, screen: NSScreen) {
+        init(wallpaper: ResolvedWallpaper, screen: NSScreen, window: DesktopWallpaperWindow? = nil) {
             self.wallpaper = wallpaper
-            window = DesktopWallpaperWindow(screen: screen)
-            window.update(screen: screen)
-            player = CrossfadeVideoPlayer(window: window)
+            self.window = window ?? DesktopWallpaperWindow(screen: screen)
+            self.window.update(screen: screen)
+            player = CrossfadeVideoPlayer(window: self.window)
         }
 
         func stop() {
@@ -30,6 +31,7 @@ final class WallpaperController {
             player.onFirstFrame = nil
             player.onFailure = nil
             player.stop()
+            window.clearTransitionImage()
             window.close()
             presented = false
             previous?.stop()
@@ -41,6 +43,9 @@ final class WallpaperController {
     private let resolver = CurrentWallpaperResolver()
     private var sessions: [String: Session] = [:]
     private var screenNames: [String: String] = [:]
+    private var stillImageWindows: [String: DesktopWallpaperWindow] = [:]
+    private var stillImageURLs: [String: URL] = [:]
+    private var stillImageTasks: [String: Task<Void, Never>] = [:]
     private var errors: [String: String] = [:]
     private var suspensions: Set<Suspension> = []
     private var notifications: [(NotificationCenter, NSObjectProtocol)] = []
@@ -152,6 +157,7 @@ final class WallpaperController {
             sessions.removeValue(forKey: id)?.stop()
             errors.removeValue(forKey: id)
         }
+        for id in Array(stillImageURLs.keys) where screens[id] == nil { clearStillImage(id: id) }
         let displayIDs = Array(screens.keys)
         let resolver = resolver
         refreshTask = Task { [weak self] in
@@ -173,14 +179,21 @@ final class WallpaperController {
                         self.errors.removeValue(forKey: id)
                         self.createSession(wallpaper: wallpaper, screen: screen, id: id)
                     case .failure(let error):
-                        if error == .notAerial { self.fadeOutSession(id: id) }
-                        else { self.sessions.removeValue(forKey: id)?.stop() }
+                        if error == .notAerial {
+                            self.cacheStillImage(screen: screen, id: id)
+                            self.stillImageWindows[id]?.update(screen: screen)
+                            self.fadeOutSession(id: id)
+                        } else {
+                            self.clearStillImage(id: id)
+                            self.sessions.removeValue(forKey: id)?.stop()
+                        }
                         self.errors[id] = error.localizedDescription
                     }
                 }
             case .failure(let error):
                 self.sessions.values.forEach { $0.stop() }
                 self.sessions.removeAll()
+                for id in Array(self.stillImageURLs.keys) { self.clearStillImage(id: id) }
                 self.errors = Dictionary(uniqueKeysWithValues: displayIDs.map { ($0, "无法读取壁纸配置：\(error.localizedDescription)") })
             }
             self.refreshTask = nil
@@ -195,6 +208,7 @@ final class WallpaperController {
         debounceTask?.cancel()
         sessions.values.forEach { $0.stop() }
         sessions.removeAll()
+        for id in Array(stillImageURLs.keys) { clearStillImage(id: id) }
         directoryWatchers.forEach { $0.cancel() }
         directoryWatchers.removeAll()
         notifications.forEach { $0.0.removeObserver($0.1) }
@@ -202,12 +216,80 @@ final class WallpaperController {
         onChange = nil
     }
 
+    private func cacheStillImage(screen: NSScreen, id: String) {
+        guard let url = NSWorkspace.shared.desktopImageURL(for: screen), url.isFileURL else {
+            clearStillImage(id: id)
+            return
+        }
+        guard stillImageURLs[id] != url else { return }
+        clearStillImage(id: id)
+        stillImageURLs[id] = url
+        let options = NSWorkspace.shared.desktopImageOptions(for: screen) ?? [:]
+        let scaling = (options[.imageScaling] as? NSNumber).flatMap { NSImageScaling(rawValue: $0.uintValue) }
+        let gravity: CALayerContentsGravity
+        switch scaling {
+        case .scaleAxesIndependently: gravity = .resize
+        case .scaleNone: gravity = .center
+        default: gravity = (options[.allowClipping] as? Bool) == false ? .resizeAspect : .resizeAspectFill
+        }
+        let maxPixels = Int(ceil(max(screen.frame.width, screen.frame.height) * screen.backingScaleFactor))
+        stillImageTasks[id] = Task { [weak self] in
+            let image = await Task.detached(priority: .utility) { () -> CGImage? in
+                guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+                let options: [CFString: Any] = [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceCreateThumbnailWithTransform: true,
+                    kCGImageSourceThumbnailMaxPixelSize: maxPixels
+                ]
+                return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+            }.value
+            guard let self, !Task.isCancelled, self.stillImageURLs[id] == url else { return }
+            self.stillImageTasks[id] = nil
+            guard let image else {
+                self.stillImageURLs.removeValue(forKey: id)
+                return
+            }
+            let window = DesktopWallpaperWindow(screen: screen)
+            window.update(screen: screen)
+            window.setTransitionImage(image, gravity: gravity)
+            self.stillImageWindows[id] = window
+            guard self.suspensions.isEmpty else { return }
+            if let session = self.sessions[id], session.window.isVisible {
+                window.order(.below, relativeTo: session.window.windowNumber)
+            } else {
+                window.alphaValue = 0
+                window.orderFrontRegardless()
+                NSAnimationContext.runAnimationGroup({ context in
+                    context.duration = 0.35
+                    window.animator().alphaValue = 1
+                }, completionHandler: {})
+            }
+        }
+    }
+
+    private func clearStillImage(id: String) {
+        stillImageTasks.removeValue(forKey: id)?.cancel()
+        stillImageURLs.removeValue(forKey: id)
+        if let window = stillImageWindows.removeValue(forKey: id) {
+            window.clearTransitionImage()
+            window.close()
+        }
+    }
+
     private func createSession(wallpaper: ResolvedWallpaper, screen: NSScreen, id: String) {
-        let previous = retainPresentedSession(sessions[id])
+        let stillWindow = stillImageWindows.removeValue(forKey: id)
+        let previous: Session?
+        if stillWindow != nil {
+            sessions[id]?.stop()
+            previous = nil
+        } else {
+            previous = retainPresentedSession(sessions[id])
+        }
         previous?.window.update(screen: screen)
-        let session = Session(wallpaper: wallpaper, screen: screen)
+        clearStillImage(id: id)
+        let session = Session(wallpaper: wallpaper, screen: screen, window: stillWindow)
         session.previous = previous
-        if previous != nil { session.window.alphaValue = 0 }
+        if stillWindow == nil { session.window.alphaValue = 0 }
         sessions[id] = session
         session.player.setPlaybackRate(playbackRate)
         session.player.setMuted(isMuted)
@@ -216,18 +298,34 @@ final class WallpaperController {
         session.player.onFirstFrame = { [weak self, weak session] in
             guard let self, let session, self.sessions[id] === session else { return }
             session.presented = true
-            guard let previous = session.previous else { self.updateStatus(); return }
-            NSAnimationContext.runAnimationGroup { context in
-                context.duration = 1
-                context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-                session.window.animator().alphaValue = 1
-            } completionHandler: { [weak self, weak session, weak previous] in
-                Task { @MainActor [weak self, weak session, weak previous] in
-                    guard let self, let session, let previous,
-                          self.sessions[id] === session, session.previous === previous else { return }
+            let finish: @Sendable () -> Void = { [weak self, weak session] in
+                Task { @MainActor [weak self, weak session] in
+                    guard let self, let session, self.sessions[id] === session else { return }
+                    session.window.clearTransitionImage()
+                    let previous = session.previous
                     session.previous = nil
-                    previous.stop()
+                    previous?.stop()
                 }
+            }
+            if let layer = session.window.transitionImageLayer {
+                session.window.alphaValue = 1
+                let animation = CABasicAnimation(keyPath: "opacity")
+                animation.fromValue = 1
+                animation.toValue = 0
+                animation.duration = 1
+                animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                CATransaction.begin()
+                CATransaction.setCompletionBlock(finish)
+                CATransaction.setDisableActions(true)
+                layer.opacity = 0
+                layer.add(animation, forKey: "stillImageFade")
+                CATransaction.commit()
+            } else {
+                NSAnimationContext.runAnimationGroup({ context in
+                    context.duration = 1
+                    context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                    session.window.animator().alphaValue = 1
+                }, completionHandler: finish)
             }
             self.updateStatus()
         }
@@ -256,7 +354,7 @@ final class WallpaperController {
         guard let session else { return nil }
         let previous = session.previous
         session.previous = nil
-        if !session.presented {
+        if !session.presented && session.window.transitionImageLayer == nil {
             session.stop()
             return previous
         }
@@ -346,6 +444,13 @@ final class WallpaperController {
 
     private func updatePlayback() {
         let paused = userPaused || !suspensions.isEmpty
+        for window in stillImageWindows.values {
+            if suspensions.isEmpty {
+                if !window.isVisible { window.orderFrontRegardless() }
+            } else {
+                window.orderOut(nil)
+            }
+        }
         for session in sessions.values {
             if session.retiring {
                 if suspensions.isEmpty { session.window.orderFrontRegardless() }
