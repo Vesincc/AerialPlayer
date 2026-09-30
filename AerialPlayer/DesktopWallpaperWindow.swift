@@ -1,5 +1,4 @@
 import AppKit
-import AVFoundation
 import QuartzCore
 import CoreGraphics
 
@@ -56,5 +55,4 @@ final class DesktopWallpaperWindow: NSWindow {
         videoSurface.sublayers?.forEach { $0.frame = videoSurface.bounds }
         CATransaction.commit()
     }
-
 }

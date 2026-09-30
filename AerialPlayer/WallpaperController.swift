@@ -1,57 +1,17 @@
 import AppKit
 import CoreGraphics
-import ImageIO
-import QuartzCore
-import Foundation
-import Darwin
 
 @MainActor
 final class WallpaperController {
     static let playbackRateRange: ClosedRange<Float> = 0.25...2
 
-    private final class Session {
-        let wallpaper: ResolvedWallpaper
-        let window: DesktopWallpaperWindow
-        let player: CrossfadeVideoPlayer
-        var loadTask: Task<Void, Never>?
-        var previous: Session?
-        var presented = false
-        var retiring = false
-
-        init(wallpaper: ResolvedWallpaper, screen: NSScreen, window: DesktopWallpaperWindow? = nil) {
-            self.wallpaper = wallpaper
-            self.window = window ?? DesktopWallpaperWindow(screen: screen)
-            self.window.update(screen: screen)
-            player = CrossfadeVideoPlayer(window: self.window)
-        }
-
-        func stop() {
-            loadTask?.cancel()
-            loadTask = nil
-            player.onFirstFrame = nil
-            player.onFailure = nil
-            player.stop()
-            window.clearTransitionImage()
-            window.close()
-            presented = false
-            previous?.stop()
-            previous = nil
-        }
-    }
-
-    private enum Suspension: Hashable { case locked, displaySleep, systemSleep, inactiveSession, thermal }
     private let resolver = CurrentWallpaperResolver()
-    private var sessions: [String: Session] = [:]
+    private let eventMonitor = WallpaperEventMonitor()
+    private let stillWallpapers = StillWallpaperStore()
+    private var sessions: [String: WallpaperSession] = [:]
     private var screenNames: [String: String] = [:]
-    private var stillImageWindows: [String: DesktopWallpaperWindow] = [:]
-    private var stillImageURLs: [String: URL] = [:]
-    private var stillImageTasks: [String: Task<Void, Never>] = [:]
     private var errors: [String: String] = [:]
-    private var suspensions: Set<Suspension> = []
-    private var notifications: [(NotificationCenter, NSObjectProtocol)] = []
-    private var directoryWatchers: [DispatchSourceFileSystemObject] = []
     private var refreshTask: Task<Void, Never>?
-    private var debounceTask: Task<Void, Never>?
     private var refreshGeneration = 0
     private var stopped = false
     private(set) var userPaused = false
@@ -60,6 +20,19 @@ final class WallpaperController {
     private(set) var fillMode: VideoFillMode
     private(set) var statusMessage = "正在读取当前壁纸…"
     var onChange: (() -> Void)?
+
+    private var isPaused: Bool { userPaused || eventMonitor.isSuspended }
+
+    var hasVideo: Bool {
+        sessions.contains { !$0.value.isRetiring && ($0.value.isPresented || errors[$0.key] == nil) }
+    }
+
+    var wallpaperDescriptions: [String] {
+        screenNames.keys.sorted().map { id in
+            let description = errors[id] ?? sessions[id]?.wallpaper.name ?? "正在读取…"
+            return "\(screenNames[id] ?? "显示器")：\(description)"
+        }
+    }
 
     init() {
         let defaults = UserDefaults.standard
@@ -70,37 +43,25 @@ final class WallpaperController {
         fillMode = defaults.string(forKey: "fillMode").flatMap(VideoFillMode.init(rawValue:)) ?? .aspectFill
     }
 
-    var hasVideo: Bool { sessions.contains { !$0.value.retiring && ($0.value.presented || errors[$0.key] == nil) } }
-
-    var wallpaperDescriptions: [String] {
-        screenNames.keys.sorted().map { id in
-            let description = errors[id] ?? sessions[id]?.wallpaper.name ?? "正在读取…"
-            return "\(screenNames[id] ?? "显示器")：\(description)"
-        }
+    func start() {
+        eventMonitor.onRefresh = { [weak self] in self?.refresh() }
+        eventMonitor.onSuspensionChange = { [weak self] in self?.updatePlayback() }
+        eventMonitor.start(directories: [
+            resolver.storeDirectory,
+            resolver.aerialsDirectory.appendingPathComponent("videos", isDirectory: true)
+        ])
+        refresh()
     }
 
-    func start() {
-        let workspace = NSWorkspace.shared.notificationCenter
-        observe(workspace, NSWorkspace.screensDidSleepNotification) { $0.setSuspension(.displaySleep, enabled: true) }
-        observe(workspace, NSWorkspace.screensDidWakeNotification) { $0.setSuspension(.displaySleep, enabled: false) }
-        observe(workspace, NSWorkspace.willSleepNotification) { $0.setSuspension(.systemSleep, enabled: true) }
-        observe(workspace, NSWorkspace.didWakeNotification) { $0.setSuspension(.systemSleep, enabled: false); $0.refresh() }
-        observe(workspace, NSWorkspace.sessionDidResignActiveNotification) { $0.setSuspension(.inactiveSession, enabled: true) }
-        observe(workspace, NSWorkspace.sessionDidBecomeActiveNotification) { $0.setSuspension(.inactiveSession, enabled: false); $0.refresh() }
-        observe(workspace, NSWorkspace.activeSpaceDidChangeNotification) { $0.scheduleRefresh() }
-        observe(.default, NSApplication.didChangeScreenParametersNotification) { $0.scheduleRefresh() }
-        observe(.default, ProcessInfo.thermalStateDidChangeNotification) { $0.updateThermalState() }
-        observe(DistributedNotificationCenter.default(), Notification.Name("com.apple.screenIsLocked")) {
-            $0.setSuspension(.locked, enabled: true)
-        }
-        observe(DistributedNotificationCenter.default(), Notification.Name("com.apple.screenIsUnlocked")) {
-            $0.setSuspension(.locked, enabled: false)
-            $0.refresh()
-        }
-        updateThermalState()
-        watchDirectory(resolver.storeDirectory)
-        watchDirectory(resolver.aerialsDirectory.appendingPathComponent("videos", isDirectory: true))
-        refresh()
+    func stop() {
+        stopped = true
+        refreshGeneration += 1
+        refreshTask?.cancel()
+        refreshTask = nil
+        eventMonitor.stop()
+        stopSessions()
+        stillWallpapers.removeAll()
+        onChange = nil
     }
 
     func togglePaused() {
@@ -112,20 +73,14 @@ final class WallpaperController {
         guard Self.playbackRateRange.contains(rate), playbackRate != rate else { return }
         playbackRate = rate
         UserDefaults.standard.set(rate, forKey: "playbackRate")
-        for session in sessions.values {
-            session.player.setPlaybackRate(rate)
-            session.previous?.player.setPlaybackRate(rate)
-        }
+        sessions.values.forEach { $0.setPlaybackRate(rate) }
         updateStatus()
     }
 
     func toggleMuted() {
         isMuted.toggle()
         UserDefaults.standard.set(isMuted, forKey: "isMuted")
-        for session in sessions.values {
-            session.player.setMuted(isMuted)
-            session.previous?.player.setMuted(isMuted)
-        }
+        sessions.values.forEach { $0.setMuted(isMuted) }
         updateStatus()
     }
 
@@ -133,16 +88,13 @@ final class WallpaperController {
         guard fillMode != mode else { return }
         fillMode = mode
         UserDefaults.standard.set(mode.rawValue, forKey: "fillMode")
-        for session in sessions.values {
-            session.player.setFillMode(mode)
-            session.previous?.player.setFillMode(mode)
-        }
+        sessions.values.forEach { $0.setFillMode(mode) }
         updateStatus()
     }
 
     func refresh(force: Bool = false) {
         guard !stopped else { return }
-        debounceTask?.cancel()
+        eventMonitor.cancelPendingRefresh()
         refreshTask?.cancel()
         refreshGeneration += 1
         let generation = refreshGeneration
@@ -155,10 +107,9 @@ final class WallpaperController {
         errors = errors.filter { screens[$0.key] != nil }
         for id in Array(sessions.keys) where screens[id] == nil {
             sessions.removeValue(forKey: id)?.stop()
-            errors.removeValue(forKey: id)
         }
-        for id in Array(stillImageURLs.keys) where screens[id] == nil { clearStillImage(id: id) }
         let displayIDs = Array(screens.keys)
+        stillWallpapers.removeDisconnected(keeping: Set(displayIDs))
         let resolver = resolver
         refreshTask = Task { [weak self] in
             let result = await Task.detached(priority: .utility) {
@@ -169,311 +120,115 @@ final class WallpaperController {
             case .success(let wallpapers):
                 for (id, screen) in screens {
                     guard let selection = wallpapers[id] else { continue }
-                    switch selection {
-                    case .success(let wallpaper):
-                        if !force, let session = self.sessions[id], session.wallpaper == wallpaper, self.errors[id] == nil {
-                            session.window.update(screen: screen)
-                            session.previous?.window.update(screen: screen)
-                            continue
-                        }
-                        self.errors.removeValue(forKey: id)
-                        self.createSession(wallpaper: wallpaper, screen: screen, id: id)
-                    case .failure(let error):
-                        if error == .notAerial {
-                            self.cacheStillImage(screen: screen, id: id)
-                            self.stillImageWindows[id]?.update(screen: screen)
-                            self.fadeOutSession(id: id)
-                        } else {
-                            self.clearStillImage(id: id)
-                            self.sessions.removeValue(forKey: id)?.stop()
-                        }
-                        self.errors[id] = error.localizedDescription
-                    }
+                    self.applySelection(selection, screen: screen, id: id, force: force)
                 }
             case .failure(let error):
-                self.sessions.values.forEach { $0.stop() }
-                self.sessions.removeAll()
-                for id in Array(self.stillImageURLs.keys) { self.clearStillImage(id: id) }
-                self.errors = Dictionary(uniqueKeysWithValues: displayIDs.map { ($0, "无法读取壁纸配置：\(error.localizedDescription)") })
+                self.stopSessions()
+                self.stillWallpapers.removeAll()
+                self.errors = Dictionary(uniqueKeysWithValues: displayIDs.map {
+                    ($0, "无法读取壁纸配置：\(error.localizedDescription)")
+                })
             }
             self.refreshTask = nil
             self.updateStatus()
         }
     }
 
-    func stop() {
-        stopped = true
-        refreshGeneration += 1
-        refreshTask?.cancel()
-        debounceTask?.cancel()
-        sessions.values.forEach { $0.stop() }
-        sessions.removeAll()
-        for id in Array(stillImageURLs.keys) { clearStillImage(id: id) }
-        directoryWatchers.forEach { $0.cancel() }
-        directoryWatchers.removeAll()
-        notifications.forEach { $0.0.removeObserver($0.1) }
-        notifications.removeAll()
-        onChange = nil
-    }
-
-    private func cacheStillImage(screen: NSScreen, id: String) {
-        guard let url = NSWorkspace.shared.desktopImageURL(for: screen), url.isFileURL else {
-            clearStillImage(id: id)
-            return
-        }
-        guard stillImageURLs[id] != url else { return }
-        clearStillImage(id: id)
-        stillImageURLs[id] = url
-        let options = NSWorkspace.shared.desktopImageOptions(for: screen) ?? [:]
-        let scaling = (options[.imageScaling] as? NSNumber).flatMap { NSImageScaling(rawValue: $0.uintValue) }
-        let gravity: CALayerContentsGravity
-        switch scaling {
-        case .scaleAxesIndependently: gravity = .resize
-        case .scaleNone: gravity = .center
-        default: gravity = (options[.allowClipping] as? Bool) == false ? .resizeAspect : .resizeAspectFill
-        }
-        let maxPixels = Int(ceil(max(screen.frame.width, screen.frame.height) * screen.backingScaleFactor))
-        stillImageTasks[id] = Task { [weak self] in
-            let image = await Task.detached(priority: .utility) { () -> CGImage? in
-                guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
-                let options: [CFString: Any] = [
-                    kCGImageSourceCreateThumbnailFromImageAlways: true,
-                    kCGImageSourceCreateThumbnailWithTransform: true,
-                    kCGImageSourceThumbnailMaxPixelSize: maxPixels
-                ]
-                return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
-            }.value
-            guard let self, !Task.isCancelled, self.stillImageURLs[id] == url else { return }
-            self.stillImageTasks[id] = nil
-            guard let image else {
-                self.stillImageURLs.removeValue(forKey: id)
+    private func applySelection(_ selection: Result<ResolvedWallpaper, CurrentWallpaperResolver.ResolutionError>,
+                                screen: NSScreen, id: String, force: Bool) {
+        switch selection {
+        case .success(let wallpaper):
+            if !force, let session = sessions[id], session.wallpaper == wallpaper, errors[id] == nil {
+                session.update(screen: screen)
                 return
             }
-            let window = DesktopWallpaperWindow(screen: screen)
-            window.update(screen: screen)
-            window.setTransitionImage(image, gravity: gravity)
-            self.stillImageWindows[id] = window
-            guard self.suspensions.isEmpty else { return }
-            if let session = self.sessions[id], session.window.isVisible {
-                window.order(.below, relativeTo: session.window.windowNumber)
+            errors.removeValue(forKey: id)
+            createSession(wallpaper: wallpaper, screen: screen, id: id)
+        case .failure(let error):
+            if error == .notAerial {
+                fadeOutSession(id: id)
+                stillWallpapers.prepare(screen: screen, id: id, below: sessions[id]?.window)
             } else {
-                window.alphaValue = 0
-                window.orderFrontRegardless()
-                NSAnimationContext.runAnimationGroup({ context in
-                    context.duration = 0.35
-                    window.animator().alphaValue = 1
-                }, completionHandler: {})
+                stillWallpapers.remove(id: id)
+                sessions.removeValue(forKey: id)?.stop()
             }
-        }
-    }
-
-    private func clearStillImage(id: String) {
-        stillImageTasks.removeValue(forKey: id)?.cancel()
-        stillImageURLs.removeValue(forKey: id)
-        if let window = stillImageWindows.removeValue(forKey: id) {
-            window.clearTransitionImage()
-            window.close()
+            errors[id] = error.localizedDescription
         }
     }
 
     private func createSession(wallpaper: ResolvedWallpaper, screen: NSScreen, id: String) {
-        let stillWindow = stillImageWindows.removeValue(forKey: id)
-        let previous: Session?
+        let stillWindow = stillWallpapers.takeWindow(id: id)
+        let previous: WallpaperSession?
         if stillWindow != nil {
             sessions[id]?.stop()
             previous = nil
         } else {
-            previous = retainPresentedSession(sessions[id])
+            previous = sessions[id]?.retainForReplacement()
         }
-        previous?.window.update(screen: screen)
-        clearStillImage(id: id)
-        let session = Session(wallpaper: wallpaper, screen: screen, window: stillWindow)
-        session.previous = previous
-        if stillWindow == nil { session.window.alphaValue = 0 }
+        previous?.update(screen: screen)
+        let session = WallpaperSession(wallpaper: wallpaper, screen: screen, window: stillWindow, previous: previous)
         sessions[id] = session
-        session.player.setPlaybackRate(playbackRate)
-        session.player.setMuted(isMuted)
-        session.player.setFillMode(fillMode)
-        session.player.setPaused(userPaused || !suspensions.isEmpty)
-        session.player.onFirstFrame = { [weak self, weak session] in
+        session.setPlaybackRate(playbackRate)
+        session.setMuted(isMuted)
+        session.setFillMode(fillMode)
+        session.updatePlayback(paused: isPaused, hidden: eventMonitor.isSuspended)
+        session.onChange = { [weak self, weak session] in
             guard let self, let session, self.sessions[id] === session else { return }
-            session.presented = true
-            let finish: @Sendable () -> Void = { [weak self, weak session] in
-                Task { @MainActor [weak self, weak session] in
-                    guard let self, let session, self.sessions[id] === session else { return }
-                    session.window.clearTransitionImage()
-                    let previous = session.previous
-                    session.previous = nil
-                    previous?.stop()
-                }
-            }
-            if let layer = session.window.transitionImageLayer {
-                session.window.alphaValue = 1
-                let animation = CABasicAnimation(keyPath: "opacity")
-                animation.fromValue = 1
-                animation.toValue = 0
-                animation.duration = 1
-                animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-                CATransaction.begin()
-                CATransaction.setCompletionBlock(finish)
-                CATransaction.setDisableActions(true)
-                layer.opacity = 0
-                layer.add(animation, forKey: "stillImageFade")
-                CATransaction.commit()
-            } else {
-                NSAnimationContext.runAnimationGroup({ context in
-                    context.duration = 1
-                    context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-                    session.window.animator().alphaValue = 1
-                }, completionHandler: finish)
-            }
             self.updateStatus()
         }
-        session.player.onFailure = { [weak self, weak session] message in
+        session.onFailure = { [weak self, weak session] message in
             guard let self, let session, self.sessions[id] === session else { return }
             self.sessionFailed(session, id: id, message: message)
         }
-        session.loadTask = Task { [weak self, weak session] in
-            guard let self, let session else { return }
-            do {
-                try await session.player.load(url: wallpaper.videoURL)
-            } catch is CancellationError {
-                return
-            } catch {
-                guard self.sessions[id] === session else { return }
-                self.sessionFailed(session, id: id, message: error.localizedDescription)
-                return
-            }
-            guard self.sessions[id] === session else { return }
-            session.loadTask = nil
-            self.updateStatus()
-        }
+        session.startLoading()
     }
 
-    private func retainPresentedSession(_ session: Session?) -> Session? {
-        guard let session else { return nil }
-        let previous = session.previous
-        session.previous = nil
-        if !session.presented && session.window.transitionImageLayer == nil {
-            session.stop()
-            return previous
-        }
-        // Bound rapid replacements to one visible session and one incoming session.
-        session.window.alphaValue = 1
-        session.retiring = false
-        previous?.stop()
-        session.player.setPaused(true)
-        return session
-    }
-
-    private func sessionFailed(_ session: Session, id: String, message: String) {
-        let previous = session.previous
-        session.previous = nil
+    private func sessionFailed(_ session: WallpaperSession, id: String, message: String) {
+        let previous = session.detachPrevious()
         session.stop()
         sessions[id] = previous
-        previous?.player.setPaused(userPaused || !suspensions.isEmpty)
-        if !suspensions.isEmpty { previous?.window.orderOut(nil) }
+        previous?.updatePlayback(paused: isPaused, hidden: eventMonitor.isSuspended)
         errors[id] = message
         updateStatus()
     }
 
     private func fadeOutSession(id: String) {
-        guard sessions[id]?.retiring != true else { return }
-        let session = retainPresentedSession(sessions[id])
+        guard let current = sessions[id], !current.isRetiring else { return }
+        let session = current.retainForReplacement()
         sessions[id] = session
         guard let session else { return }
-        session.retiring = true
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 1
-            context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            session.window.animator().alphaValue = 0
-        } completionHandler: { [weak self, weak session] in
-            Task { @MainActor [weak self, weak session] in
-                guard let self, let session, self.sessions[id] === session, session.retiring else { return }
-                self.sessions.removeValue(forKey: id)?.stop()
-                self.updateStatus()
-            }
+        session.fadeOut { [weak self, weak session] in
+            guard let self, let session, self.sessions[id] === session else { return }
+            self.sessions.removeValue(forKey: id)?.stop()
+            self.updateStatus()
         }
     }
 
-    private func observe(_ center: NotificationCenter, _ name: Notification.Name, action: @escaping @MainActor (WallpaperController) -> Void) {
-        let observer = center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                guard let self, !self.stopped else { return }
-                action(self)
-            }
-        }
-        notifications.append((center, observer))
-    }
-
-    private func watchDirectory(_ directory: URL) {
-        let descriptor = open(directory.path, O_EVTONLY)
-        guard descriptor >= 0 else { return }
-        let source = DispatchSource.makeFileSystemObjectSource(
-            fileDescriptor: descriptor, eventMask: [.write, .rename, .delete], queue: .main
-        )
-        source.setEventHandler { [weak self] in
-            Task { @MainActor [weak self] in self?.scheduleRefresh() }
-        }
-        source.setCancelHandler { close(descriptor) }
-        directoryWatchers.append(source)
-        source.resume()
-    }
-
-    private func scheduleRefresh() {
-        guard !stopped else { return }
-        debounceTask?.cancel()
-        debounceTask = Task { [weak self] in
-            do { try await Task.sleep(for: .milliseconds(300)) }
-            catch { return }
-            self?.refresh()
-        }
-    }
-
-    private func setSuspension(_ reason: Suspension, enabled: Bool) {
-        guard suspensions.contains(reason) != enabled else { return }
-        if enabled { suspensions.insert(reason) }
-        else { suspensions.remove(reason) }
-        updatePlayback()
-    }
-
-    private func updateThermalState() {
-        let thermal = ProcessInfo.processInfo.thermalState
-        setSuspension(.thermal, enabled: thermal == .serious || thermal == .critical)
+    private func stopSessions() {
+        sessions.values.forEach { $0.stop() }
+        sessions.removeAll()
     }
 
     private func updatePlayback() {
-        let paused = userPaused || !suspensions.isEmpty
-        for window in stillImageWindows.values {
-            if suspensions.isEmpty {
-                if !window.isVisible { window.orderFrontRegardless() }
-            } else {
-                window.orderOut(nil)
-            }
-        }
-        for session in sessions.values {
-            if session.retiring {
-                if suspensions.isEmpty { session.window.orderFrontRegardless() }
-                else { session.window.orderOut(nil) }
-                continue
-            }
-            if let previous = session.previous {
-                if suspensions.isEmpty { previous.window.orderFrontRegardless() }
-                else { previous.window.orderOut(nil) }
-            }
-            session.player.setPaused(paused)
-            if !suspensions.isEmpty { session.window.orderOut(nil) }
-        }
+        stillWallpapers.setHidden(eventMonitor.isSuspended)
+        sessions.values.forEach { $0.updatePlayback(paused: isPaused, hidden: eventMonitor.isSuspended) }
         updateStatus()
     }
 
     private func updateStatus() {
-        if sessions.isEmpty || sessions.values.allSatisfy({ $0.retiring }) { statusMessage = errors.values.sorted().first ?? "未找到可播放的航拍壁纸" }
-        else if errors.count == screenNames.count { statusMessage = "播放失败，可重新读取壁纸" }
-        else if userPaused { statusMessage = "已暂停" }
-        else if !suspensions.isEmpty { statusMessage = "系统暂停，恢复后继续播放" }
-        else if sessions.values.contains(where: { $0.loadTask != nil || !$0.presented }) { statusMessage = "正在准备视频…" }
-        else { statusMessage = errors.isEmpty ? "正在播放 · 1 秒交叉淡化" : "部分显示器无法播放" }
+        if sessions.isEmpty || sessions.values.allSatisfy({ $0.isRetiring }) {
+            statusMessage = errors.values.sorted().first ?? "未找到可播放的航拍壁纸"
+        } else if errors.count == screenNames.count {
+            statusMessage = "播放失败，可重新读取壁纸"
+        } else if userPaused {
+            statusMessage = "已暂停"
+        } else if eventMonitor.isSuspended {
+            statusMessage = "系统暂停，恢复后继续播放"
+        } else if sessions.values.contains(where: { $0.isPreparing }) {
+            statusMessage = "正在准备视频…"
+        } else {
+            statusMessage = errors.isEmpty ? "正在播放 · 1 秒交叉淡化" : "部分显示器无法播放"
+        }
         onChange?()
     }
 }

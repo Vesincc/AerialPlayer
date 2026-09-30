@@ -60,7 +60,7 @@
 				000000000000000000000010 /* AerialPlayer */,
 			);
 			name = AerialPlayer;
-			productName = MyApp;
+			productName = AerialPlayer;
 			productReference = 000000000000000000000120 /* AerialPlayer.app */;
 			productType = "com.apple.product-type.application";
 		};

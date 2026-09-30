@@ -3,85 +3,55 @@ import ServiceManagement
 
 @MainActor
 final class StatusBarController: NSObject, NSMenuDelegate {
-    private final class SpeedSlider: NSSlider {
-        private(set) var isTrackingMouse = false
-
-        override func mouseDown(with event: NSEvent) {
-            isTrackingMouse = true
-            defer { isTrackingMouse = false }
-            super.mouseDown(with: event)
-        }
-    }
-
     private let controller: WallpaperController
-    private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-    private var loginItem: NSMenuItem?
-    private var loginApprovalItem: NSMenuItem?
-    private var updatingLoginItem = false
-    private var speedSlider: SpeedSlider?
-    private var speedLabel: NSTextField?
-    private var muteItem: NSMenuItem?
+    private let statusBarItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+    private let menu = NSMenu()
+    private let statusItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    private let pauseItem = NSMenuItem(title: "暂停播放", action: #selector(togglePaused), keyEquivalent: "")
+    private let muteItem = NSMenuItem(title: "静音", action: #selector(toggleMuted), keyEquivalent: "")
+    private let loginItem = NSMenuItem(title: "开机自动启动", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
+    private let loginApprovalItem = NSMenuItem(title: "在系统设置中允许自动启动…", action: #selector(openLoginItemsSettings), keyEquivalent: "")
+    private let speedControl: PlaybackSpeedControl
+    private var wallpaperItems: [NSMenuItem] = []
     private var fillItems: [VideoFillMode: NSMenuItem] = [:]
+    private var updatingLoginItem = false
     private var menuIsOpen = false
     private var menuNeedsUpdate = false
 
     init(controller: WallpaperController) {
         self.controller = controller
+        speedControl = PlaybackSpeedControl(rate: controller.playbackRate, range: WallpaperController.playbackRateRange)
         super.init()
+        buildMenu()
+        speedControl.onRateChange = { [weak controller] in controller?.setPlaybackRate($0) }
         controller.onChange = { [weak self] in self?.updateMenu() }
         updateMenu()
     }
 
     func remove() {
-        NSStatusBar.system.removeStatusItem(item)
+        NSStatusBar.system.removeStatusItem(statusBarItem)
     }
 
-    private func updateMenu() {
-        if menuIsOpen {
-            menuNeedsUpdate = true
-            updatePlaybackControls()
-            return
-        }
-        let descriptions = controller.wallpaperDescriptions
-        let symbol = controller.userPaused ? "pause.rectangle" : "play.rectangle"
-        let image = NSImage(systemSymbolName: symbol, accessibilityDescription: "AerialPlayer")
-        image?.isTemplate = true
-        item.button?.image = image
-        item.button?.toolTip = "AerialPlayer · \(controller.statusMessage)"
-
-        let menu = NSMenu()
+    private func buildMenu() {
         menu.delegate = self
         menu.autoenablesItems = false
-        let status = NSMenuItem(title: controller.statusMessage, action: nil, keyEquivalent: "")
-        status.isEnabled = false
-        menu.addItem(status)
-        for description in descriptions {
-            let wallpaper = NSMenuItem(title: description, action: nil, keyEquivalent: "")
-            wallpaper.isEnabled = false
-            menu.addItem(wallpaper)
-        }
+        statusItem.isEnabled = false
+        menu.addItem(statusItem)
         menu.addItem(.separator())
-        let pause = NSMenuItem(title: controller.userPaused ? "继续播放" : "暂停播放", action: #selector(togglePaused), keyEquivalent: "")
-        pause.target = self
-        pause.isEnabled = controller.hasVideo
-        menu.addItem(pause)
+        pauseItem.target = self
+        menu.addItem(pauseItem)
         let speed = NSMenuItem()
-        speed.view = makeSpeedControl()
+        speed.view = speedControl
         menu.addItem(speed)
-        let mute = NSMenuItem(title: "静音", action: #selector(toggleMuted), keyEquivalent: "")
-        mute.target = self
-        mute.state = controller.isMuted ? .on : .off
-        menu.addItem(mute)
-        muteItem = mute
+        muteItem.target = self
+        menu.addItem(muteItem)
         let fill = NSMenuItem(title: "填充模式", action: nil, keyEquivalent: "")
         let modes = NSMenu()
         modes.autoenablesItems = false
-        fillItems.removeAll()
         for mode in VideoFillMode.allCases {
             let option = NSMenuItem(title: mode.title, action: #selector(changeFillMode(_:)), keyEquivalent: "")
             option.target = self
             option.representedObject = mode.rawValue
-            option.state = mode == controller.fillMode ? .on : .off
             modes.addItem(option)
             fillItems[mode] = option
         }
@@ -91,20 +61,59 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         refresh.target = self
         menu.addItem(refresh)
         menu.addItem(.separator())
-        let login = NSMenuItem(title: "开机自动启动", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
-        login.target = self
-        menu.addItem(login)
-        loginItem = login
-        let approval = NSMenuItem(title: "在系统设置中允许自动启动…", action: #selector(openLoginItemsSettings), keyEquivalent: "")
-        approval.target = self
-        menu.addItem(approval)
-        loginApprovalItem = approval
-        updateLoginItem()
+        loginItem.target = self
+        menu.addItem(loginItem)
+        loginApprovalItem.target = self
+        menu.addItem(loginApprovalItem)
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "退出 AerialPlayer", action: #selector(quit), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
-        item.menu = menu
+        statusBarItem.menu = menu
+    }
+
+    private func updateMenu() {
+        updatePlaybackControls()
+        if menuIsOpen {
+            menuNeedsUpdate = true
+            return
+        }
+        let symbol = controller.userPaused ? "pause.rectangle" : "play.rectangle"
+        let image = NSImage(systemSymbolName: symbol, accessibilityDescription: "AerialPlayer")
+        image?.isTemplate = true
+        statusBarItem.button?.image = image
+        statusBarItem.button?.toolTip = "AerialPlayer · \(controller.statusMessage)"
+        statusItem.title = controller.statusMessage
+        pauseItem.title = controller.userPaused ? "继续播放" : "暂停播放"
+        pauseItem.isEnabled = controller.hasVideo
+        updateWallpaperDescriptions()
+        updateLoginItem()
+    }
+
+    private func updateWallpaperDescriptions() {
+        let descriptions = controller.wallpaperDescriptions
+        if wallpaperItems.count != descriptions.count {
+            wallpaperItems.forEach { menu.removeItem($0) }
+            wallpaperItems = descriptions.map { description in
+                let item = NSMenuItem(title: description, action: nil, keyEquivalent: "")
+                item.isEnabled = false
+                return item
+            }
+            for (index, item) in wallpaperItems.enumerated() {
+                menu.insertItem(item, at: index + 1)
+            }
+        }
+        for (item, description) in zip(wallpaperItems, descriptions) {
+            item.title = description
+        }
+    }
+
+    private func updatePlaybackControls() {
+        speedControl.update(rate: controller.playbackRate)
+        muteItem.state = controller.isMuted ? .on : .off
+        for (mode, option) in fillItems {
+            option.state = mode == controller.fillMode ? .on : .off
+        }
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -121,68 +130,20 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         }
     }
 
-    private func makeSpeedControl() -> NSView {
-        let view = NSView(frame: NSRect(x: 0, y: 0, width: 280, height: 64))
-        view.autoresizingMask = [.width]
-        let title = NSTextField(labelWithString: "播放速度")
-        title.font = .menuFont(ofSize: 0)
-        title.frame = NSRect(x: 30, y: 40, width: 90, height: 18)
-        view.addSubview(title)
-        let value = NSTextField(labelWithString: String(format: "%.2f×", Double(controller.playbackRate)))
-        value.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
-        value.alignment = .right
-        value.frame = NSRect(x: 162, y: 40, width: 54, height: 18)
-        value.autoresizingMask = [.minXMargin]
-        view.addSubview(value)
-        speedLabel = value
-        let slider = SpeedSlider(value: Double(controller.playbackRate),
-                              minValue: Double(WallpaperController.playbackRateRange.lowerBound),
-                              maxValue: Double(WallpaperController.playbackRateRange.upperBound),
-                              target: self, action: #selector(changePlaybackRate(_:)))
-        slider.controlSize = .small
-        slider.frame = NSRect(x: 30, y: 10, width: 234, height: 20)
-        slider.autoresizingMask = [.width]
-        slider.isContinuous = true
-        slider.setAccessibilityLabel("播放速度")
-        view.addSubview(slider)
-        speedSlider = slider
-        let reset = NSButton(title: "1×", target: self, action: #selector(resetPlaybackRate))
-        reset.bezelStyle = .rounded
-        reset.controlSize = .small
-        reset.frame = NSRect(x: 224, y: 36, width: 40, height: 24)
-        reset.autoresizingMask = [.minXMargin]
-        reset.toolTip = "恢复正常播放速度"
-        view.addSubview(reset)
-        return view
-    }
-
-    private func updatePlaybackControls() {
-        // AppKit owns the knob position throughout native mouse tracking.
-        if let slider = speedSlider, !slider.isTrackingMouse {
-            let value = Double(controller.playbackRate)
-            if slider.doubleValue != value { slider.doubleValue = value }
-        }
-        speedLabel?.stringValue = String(format: "%.2f×", Double(controller.playbackRate))
-        muteItem?.state = controller.isMuted ? .on : .off
-        for (mode, option) in fillItems {
-            option.state = mode == controller.fillMode ? .on : .off
-        }
-    }
-
     private func updateLoginItem() {
         let status = SMAppService.mainApp.status
-        loginItem?.title = status == .requiresApproval ? "开机自动启动（待系统允许）" : "开机自动启动"
-        loginItem?.isEnabled = !updatingLoginItem
+        loginItem.title = status == .requiresApproval ? "开机自动启动（待系统允许）" : "开机自动启动"
+        loginItem.isEnabled = !updatingLoginItem
         switch status {
-        case .enabled: loginItem?.state = .on
-        case .requiresApproval: loginItem?.state = .mixed
-        case .notRegistered, .notFound: loginItem?.state = .off
+        case .enabled: loginItem.state = .on
+        case .requiresApproval: loginItem.state = .mixed
+        case .notRegistered, .notFound: loginItem.state = .off
         @unknown default:
-            loginItem?.state = .off
-            loginItem?.isEnabled = false
+            loginItem.state = .off
+            loginItem.isEnabled = false
         }
-        loginApprovalItem?.isHidden = status != .requiresApproval
-        loginApprovalItem?.isEnabled = !updatingLoginItem
+        loginApprovalItem.isHidden = status != .requiresApproval
+        loginApprovalItem.isEnabled = !updatingLoginItem
     }
 
     @objc private func toggleLaunchAtLogin() {
@@ -222,15 +183,6 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     }
 
     @objc private func togglePaused() { controller.togglePaused() }
-    @objc private func changePlaybackRate(_ sender: NSSlider) {
-        controller.setPlaybackRate(Float((sender.doubleValue * 100).rounded() / 100))
-        updatePlaybackControls()
-    }
-    @objc private func resetPlaybackRate() {
-        controller.setPlaybackRate(1)
-        menuNeedsUpdate = true
-        updatePlaybackControls()
-    }
     @objc private func toggleMuted() { controller.toggleMuted() }
     @objc private func changeFillMode(_ sender: NSMenuItem) {
         guard let rawValue = sender.representedObject as? String, let mode = VideoFillMode(rawValue: rawValue) else { return }
